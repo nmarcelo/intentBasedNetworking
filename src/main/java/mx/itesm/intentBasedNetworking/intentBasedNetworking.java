@@ -138,6 +138,8 @@ import org.onosproject.net.intent.IntentState;
 import org.onosproject.net.intent.Key;
 import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.packet.OutboundPacket;
+import org.onosproject.net.intent.SinglePointToMultipointIntent;
+
 
 
 import java.util.EnumSet;
@@ -735,7 +737,7 @@ public class intentBasedNetworking {
                     .build();
         }
 
-      /* ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
+       /*ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
                 .withSelector(selectorBuilder.build())
                 .withTreatment(treatment)
                 .withPriority(flowPriority)
@@ -743,24 +745,32 @@ public class intentBasedNetworking {
                 .fromApp(appId)
                 .makeTemporary(flowTimeout)
                 .add();
-    */
+    
 
-       //flowObjectiveService.forward(context.inPacket().receivedFrom().deviceId(),
-       //                              forwardingObjective);
-       //forwardPacket(macMetrics);
+       flowObjectiveService.forward(context.inPacket().receivedFrom().deviceId(),
+                                     forwardingObjective);
+       forwardPacket(macMetrics);*/
+
 
 
 //  INTENT BASED NETWORKING
+       
+       // Host 2 Host reactive Forwarding
+       //HostId srcId = HostId.hostId(inPkt.getSourceMAC());
+       //HostId dstId = HostId.hostId(inPkt.getDestinationMAC());
+       //reactiveHost2HostIntentFwd(context, srcId, dstId);
 
-        HostId srcId = HostId.hostId(inPkt.getSourceMAC());
-        HostId dstId = HostId.hostId(inPkt.getDestinationMAC());
+       // Poin to multipoint reactive Forwarding
 
-        setUpConnectivity(context, srcId, dstId);
+       HostId srcId = HostId.hostId(inPkt.getSourceMAC());
+       HostId dstId = HostId.hostId(inPkt.getDestinationMAC());
+       reactivePoint2MultipointIntentFwd(context, srcId, dstId);
+
 
 //////////////////////////
        //
         
-        //forwardPacket(macMetrics);
+        forwardPacket(macMetrics);
         //
         // If packetOutOfppTable
         //  Send packet back to the OpenFlow pipeline to match installed flow
@@ -774,9 +784,79 @@ public class intentBasedNetworking {
         }
     }
 
+        // Point to Multipoint intent Install a rule forwarding the packet to the specified port.
+    private void reactivePoint2MultipointIntentFwd(PacketContext context, HostId srcId, HostId dstId) {
+        TrafficSelector selector = DefaultTrafficSelector.emptySelector();
+        TrafficTreatment treatment = DefaultTrafficTreatment.emptyTreatment();
 
-    // Install a rule forwarding the packet to the specified port.
-    private void setUpConnectivity(PacketContext context, HostId srcId, HostId dstId) {
+        Key key;
+        if (srcId.toString().compareTo(dstId.toString()) < 0) {
+            key = Key.of(srcId.toString() + dstId.toString(), appId);
+        } else {
+            key = Key.of(dstId.toString() + srcId.toString(), appId);
+        }
+
+        HostToHostIntent intent = (HostToHostIntent) intentService.getIntent(key);
+        // TODO handle the FAILED state
+        if (intent != null) {
+            if (WITHDRAWN_STATES.contains(intentService.getIntentState(key))) {
+                HostToHostIntent hostIntent = HostToHostIntent.builder()
+                        .appId(appId)
+                        .key(key)
+                        .one(srcId)
+                        .two(dstId)
+                        .selector(selector)
+                        .treatment(treatment)
+                        .build();
+
+                intentService.submit(hostIntent);
+            } else if (intentService.getIntentState(key) == IntentState.FAILED) {
+
+                TrafficSelector objectiveSelector = DefaultTrafficSelector.builder()
+                        .matchEthSrc(srcId.mac()).matchEthDst(dstId.mac()).build();
+
+                TrafficTreatment dropTreatment = DefaultTrafficTreatment.builder()
+                        .drop().build();
+
+                ForwardingObjective objective = DefaultForwardingObjective.builder()
+                        .withSelector(objectiveSelector)
+                        .withTreatment(dropTreatment)
+                        .fromApp(appId)
+                        .withPriority(intent.priority() - 1)
+                        .makeTemporary(DROP_RULE_TIMEOUT)
+                        .withFlag(ForwardingObjective.Flag.VERSATILE)
+                        .add();
+
+                flowObjectiveService.forward(context.outPacket().sendThrough(), objective);
+            }
+
+        } else if (intent == null) {
+            final Constraint constraintBandwidth =
+                new BandwidthConstraint(Bandwidth.mbps(0));
+            final Constraint constraintLatency =
+                new LatencyConstraint(Duration.of(0, ChronoUnit.MICROS));
+            final List<Constraint> constraints = new LinkedList<>();
+
+            constraints.add(constraintBandwidth);
+            constraints.add(constraintLatency);
+
+            HostToHostIntent hostIntent = HostToHostIntent.builder()
+                    .appId(appId)
+                    .key(key)
+                    .one(srcId)
+                    .two(dstId)
+                    .selector(selector)
+                    .treatment(treatment)
+                    .constraints(constraints)
+                    .build();
+
+            intentService.submit(hostIntent);
+        }
+
+    }
+
+    // Host to Host intent Install a rule forwarding the packet to the specified port.
+    private void reactiveHost2HostIntentFwd(PacketContext context, HostId srcId, HostId dstId) {
         TrafficSelector selector = DefaultTrafficSelector.emptySelector();
         TrafficTreatment treatment = DefaultTrafficTreatment.emptyTreatment();
 
