@@ -138,12 +138,13 @@ import org.onosproject.net.intent.IntentState;
 import org.onosproject.net.intent.Key;
 import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.packet.OutboundPacket;
-import org.onosproject.net.intent.SinglePointToMultipointIntent;
-
+import org.onosproject.net.intent.SinglePointToMultiPointIntent;
+import org.onosproject.net.FilteredConnectPoint;
 
 
 import java.util.EnumSet;
 import java.util.Set;
+import com.google.common.collect.Sets;
 
 
 @Component(immediate = true)
@@ -182,6 +183,10 @@ public class intentBasedNetworking {
     protected IntentService intentService;
 
     private static final int DROP_RULE_TIMEOUT = 300;
+
+    private static final DeviceId mirrorDeviceID = DeviceId.deviceId("of:0000000000000101");
+    private PortNumber mirrorPortNumber;
+    private static final PortNumber PktCollectorPortNumber = PortNumber.portNumber(1);
 
     private static final EnumSet<IntentState> WITHDRAWN_STATES = EnumSet.of(IntentState.WITHDRAWN,
                                                                             IntentState.WITHDRAWING,
@@ -533,6 +538,16 @@ public class intentBasedNetworking {
                 return;
             }
 
+
+            // Are we on the mirroring switch? If so,
+            // simply forward out to the Packet Collector and bail.
+            if (pkt.receivedFrom().deviceId().equals(mirrorDeviceID)) {
+                if (!context.inPacket().receivedFrom().port().equals(dst.location().port())) {
+                    installRuleFwd(context, PktCollectorPortNumber, macMetrics);
+                }
+                return;
+            }
+
             // Are we on an edge switch that our destination is on? If so,
             // simply forward out to the destination and bail.
             if (pkt.receivedFrom().deviceId().equals(dst.location().deviceId())) {
@@ -541,6 +556,7 @@ public class intentBasedNetworking {
                 }
                 return;
             }
+
 
             // Otherwise, get a set of paths that lead from here to the
             // destination edge switch.
@@ -585,9 +601,16 @@ public class intentBasedNetworking {
     // specified port if possible.
     private Path pickForwardPathIfPossible(Set<Path> paths, PortNumber notToPort) {
         for (Path path : paths) {
-            if (!path.src().port().equals(notToPort)) {
-                return path;
+            Boolean includeMirrorDevice = false;
+            for (Link link:path.links()){
+                if (link.dst().deviceId().equals(mirrorDeviceID)) { // avoid path that goes to the mirrorring SW
+                    includeMirrorDevice = true;
+                    mirrorPortNumber = link.dst().port();
+                }
             }
+            if (!path.src().port().equals(notToPort)  && !includeMirrorDevice) { // do not return to the same port
+                        return path;
+                    }
         }
         return null;
     }
@@ -764,7 +787,12 @@ public class intentBasedNetworking {
 
        HostId srcId = HostId.hostId(inPkt.getSourceMAC());
        HostId dstId = HostId.hostId(inPkt.getDestinationMAC());
-       reactivePoint2MultipointIntentFwd(context, srcId, dstId);
+       reactivePoint2MultipointIntentFwd(context, 
+                                         portNumber, // shortest path forwarding
+                                         mirrorPortNumber, // mirrorring to the IDS
+                                         srcId,        // src host, to evaluate
+                                         dstId     // dst host, to evaluate
+                                         );
 
 
 //////////////////////////
@@ -784,8 +812,163 @@ public class intentBasedNetworking {
         }
     }
 
+
+    // Install a rule forwarding the packet to the specified port.
+    private void installRuleFwd(PacketContext context, PortNumber portNumber, ReactiveForwardMetrics macMetrics) {
+        //
+        // We don't support (yet) buffer IDs in the Flow Service so
+        // packet out first.
+        //
+        Ethernet inPkt = context.inPacket().parsed();
+        TrafficSelector.Builder selectorBuilder = DefaultTrafficSelector.builder();
+
+        // If PacketOutOnly or ARP packet than forward directly to output port
+        if (packetOutOnly || inPkt.getEtherType() == Ethernet.TYPE_ARP) {
+            packetOut(context, portNumber, macMetrics);
+            return;
+        }
+
+        //
+        // If matchDstMacOnly
+        //    Create flows matching dstMac only
+        // Else
+        //    Create flows with default matching and include configured fields
+        //
+        if (matchDstMacOnly) {
+            selectorBuilder.matchEthDst(inPkt.getDestinationMAC());
+        } else {
+            selectorBuilder.matchInPort(context.inPacket().receivedFrom().port())
+                    .matchEthSrc(inPkt.getSourceMAC())
+                    .matchEthDst(inPkt.getDestinationMAC());
+
+            // If configured Match Vlan ID
+            if (matchVlanId && inPkt.getVlanID() != Ethernet.VLAN_UNTAGGED) {
+                selectorBuilder.matchVlanId(VlanId.vlanId(inPkt.getVlanID()));
+            }
+
+            //
+            // If configured and EtherType is IPv4 - Match IPv4 and
+            // TCP/UDP/ICMP fields
+            //
+            if (matchIpv4Address && inPkt.getEtherType() == Ethernet.TYPE_IPV4) {
+                IPv4 ipv4Packet = (IPv4) inPkt.getPayload();
+                byte ipv4Protocol = ipv4Packet.getProtocol();
+                Ip4Prefix matchIp4SrcPrefix =
+                        Ip4Prefix.valueOf(ipv4Packet.getSourceAddress(),
+                                          Ip4Prefix.MAX_MASK_LENGTH);
+                Ip4Prefix matchIp4DstPrefix =
+                        Ip4Prefix.valueOf(ipv4Packet.getDestinationAddress(),
+                                          Ip4Prefix.MAX_MASK_LENGTH);
+                selectorBuilder.matchEthType(Ethernet.TYPE_IPV4)
+                        .matchIPSrc(matchIp4SrcPrefix)
+                        .matchIPDst(matchIp4DstPrefix);
+
+                if (matchIpv4Dscp) {
+                    byte dscp = ipv4Packet.getDscp();
+                    byte ecn = ipv4Packet.getEcn();
+                    selectorBuilder.matchIPDscp(dscp).matchIPEcn(ecn);
+                }
+
+                if (matchTcpUdpPorts && ipv4Protocol == IPv4.PROTOCOL_TCP) {
+                    TCP tcpPacket = (TCP) ipv4Packet.getPayload();
+                    selectorBuilder.matchIPProtocol(ipv4Protocol)
+                            .matchTcpSrc(TpPort.tpPort(tcpPacket.getSourcePort()))
+                            .matchTcpDst(TpPort.tpPort(tcpPacket.getDestinationPort()));
+                }
+                if (matchTcpUdpPorts && ipv4Protocol == IPv4.PROTOCOL_UDP) {
+                    UDP udpPacket = (UDP) ipv4Packet.getPayload();
+                    selectorBuilder.matchIPProtocol(ipv4Protocol)
+                            .matchUdpSrc(TpPort.tpPort(udpPacket.getSourcePort()))
+                            .matchUdpDst(TpPort.tpPort(udpPacket.getDestinationPort()));
+                }
+                if (matchIcmpFields && ipv4Protocol == IPv4.PROTOCOL_ICMP) {
+                    ICMP icmpPacket = (ICMP) ipv4Packet.getPayload();
+                    selectorBuilder.matchIPProtocol(ipv4Protocol)
+                            .matchIcmpType(icmpPacket.getIcmpType())
+                            .matchIcmpCode(icmpPacket.getIcmpCode());
+                }
+            }
+
+            //
+            // If configured and EtherType is IPv6 - Match IPv6 and
+            // TCP/UDP/ICMP fields
+            //
+            if (matchIpv6Address && inPkt.getEtherType() == Ethernet.TYPE_IPV6) {
+                IPv6 ipv6Packet = (IPv6) inPkt.getPayload();
+                byte ipv6NextHeader = ipv6Packet.getNextHeader();
+                Ip6Prefix matchIp6SrcPrefix =
+                        Ip6Prefix.valueOf(ipv6Packet.getSourceAddress(),
+                                          Ip6Prefix.MAX_MASK_LENGTH);
+                Ip6Prefix matchIp6DstPrefix =
+                        Ip6Prefix.valueOf(ipv6Packet.getDestinationAddress(),
+                                          Ip6Prefix.MAX_MASK_LENGTH);
+                selectorBuilder.matchEthType(Ethernet.TYPE_IPV6)
+                        .matchIPv6Src(matchIp6SrcPrefix)
+                        .matchIPv6Dst(matchIp6DstPrefix);
+
+                if (matchIpv6FlowLabel) {
+                    selectorBuilder.matchIPv6FlowLabel(ipv6Packet.getFlowLabel());
+                }
+
+                if (matchTcpUdpPorts && ipv6NextHeader == IPv6.PROTOCOL_TCP) {
+                    TCP tcpPacket = (TCP) ipv6Packet.getPayload();
+                    selectorBuilder.matchIPProtocol(ipv6NextHeader)
+                            .matchTcpSrc(TpPort.tpPort(tcpPacket.getSourcePort()))
+                            .matchTcpDst(TpPort.tpPort(tcpPacket.getDestinationPort()));
+                }
+                if (matchTcpUdpPorts && ipv6NextHeader == IPv6.PROTOCOL_UDP) {
+                    UDP udpPacket = (UDP) ipv6Packet.getPayload();
+                    selectorBuilder.matchIPProtocol(ipv6NextHeader)
+                            .matchUdpSrc(TpPort.tpPort(udpPacket.getSourcePort()))
+                            .matchUdpDst(TpPort.tpPort(udpPacket.getDestinationPort()));
+                }
+                if (matchIcmpFields && ipv6NextHeader == IPv6.PROTOCOL_ICMP6) {
+                    ICMP6 icmp6Packet = (ICMP6) ipv6Packet.getPayload();
+                    selectorBuilder.matchIPProtocol(ipv6NextHeader)
+                            .matchIcmpv6Type(icmp6Packet.getIcmpType())
+                            .matchIcmpv6Code(icmp6Packet.getIcmpCode());
+                }
+            }
+        }
+        TrafficTreatment treatment;
+        if (inheritFlowTreatment) {
+            treatment = context.treatmentBuilder()
+                    .setOutput(portNumber)
+                    .build();
+        } else {
+            treatment = DefaultTrafficTreatment.builder()
+                    .setOutput(portNumber)
+                    .build();
+        }
+
+       ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
+                .withSelector(selectorBuilder.build())
+                .withTreatment(treatment)
+                .withPriority(flowPriority)
+                .withFlag(ForwardingObjective.Flag.VERSATILE)
+                .fromApp(appId)
+                .makeTemporary(flowTimeout)
+                .add();
+
+       flowObjectiveService.forward(context.inPacket().receivedFrom().deviceId(),
+                                     forwardingObjective);
+        forwardPacket(macMetrics);
+        //
+        // If packetOutOfppTable
+        //  Send packet back to the OpenFlow pipeline to match installed flow
+        // Else
+        //  Send packet direction on the appropriate port
+        //
+        if (packetOutOfppTable) {
+            packetOut(context, PortNumber.TABLE, macMetrics);
+        } else {
+            packetOut(context, portNumber, macMetrics);
+        }
+    }
+
+
         // Point to Multipoint intent Install a rule forwarding the packet to the specified port.
-    private void reactivePoint2MultipointIntentFwd(PacketContext context, HostId srcId, HostId dstId) {
+    private void reactivePoint2MultipointIntentFwd(PacketContext context, PortNumber fwdP, PortNumber mirrorP, HostId srcId, HostId dstId) {
         TrafficSelector selector = DefaultTrafficSelector.emptySelector();
         TrafficTreatment treatment = DefaultTrafficTreatment.emptyTreatment();
 
@@ -800,16 +983,36 @@ public class intentBasedNetworking {
         // TODO handle the FAILED state
         if (intent != null) {
             if (WITHDRAWN_STATES.contains(intentService.getIntentState(key))) {
-                HostToHostIntent hostIntent = HostToHostIntent.builder()
+                final Constraint constraintBandwidth =
+                new BandwidthConstraint(Bandwidth.mbps(1));
+                final Constraint constraintLatency =
+                    new LatencyConstraint(Duration.of(1, ChronoUnit.MICROS));
+                final List<Constraint> constraints = new LinkedList<>();
+
+                constraints.add(constraintBandwidth);
+                constraints.add(constraintLatency);
+                
+                ConnectPoint src = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                                    context.inPacket().receivedFrom().port());
+        
+                ConnectPoint  forwardPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                                    fwdP);
+                ConnectPoint  mirrorPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                                    mirrorP);
+
+
+                SinglePointToMultiPointIntent s2MIntent = SinglePointToMultiPointIntent.builder()
                         .appId(appId)
                         .key(key)
-                        .one(srcId)
-                        .two(dstId)
                         .selector(selector)
                         .treatment(treatment)
+                        .filteredIngressPoint(new FilteredConnectPoint(src))
+                        .filteredEgressPoints(Sets.newHashSet(new FilteredConnectPoint(forwardPkt), new FilteredConnectPoint(mirrorPkt)))
+                        .constraints(constraints)
                         .build();
 
-                intentService.submit(hostIntent);
+                intentService.submit(s2MIntent);
+
             } else if (intentService.getIntentState(key) == IntentState.FAILED) {
 
                 TrafficSelector objectiveSelector = DefaultTrafficSelector.builder()
@@ -832,25 +1035,34 @@ public class intentBasedNetworking {
 
         } else if (intent == null) {
             final Constraint constraintBandwidth =
-                new BandwidthConstraint(Bandwidth.mbps(0));
-            final Constraint constraintLatency =
-                new LatencyConstraint(Duration.of(0, ChronoUnit.MICROS));
-            final List<Constraint> constraints = new LinkedList<>();
+                new BandwidthConstraint(Bandwidth.mbps(1));
+                final Constraint constraintLatency =
+                    new LatencyConstraint(Duration.of(1, ChronoUnit.MICROS));
+                final List<Constraint> constraints = new LinkedList<>();
 
-            constraints.add(constraintBandwidth);
-            constraints.add(constraintLatency);
+                constraints.add(constraintBandwidth);
+                constraints.add(constraintLatency);
+                
+                ConnectPoint src = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                                    context.inPacket().receivedFrom().port());
+        
+                ConnectPoint  forwardPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                                    fwdP);
+                ConnectPoint  mirrorPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                                    mirrorP);
 
-            HostToHostIntent hostIntent = HostToHostIntent.builder()
-                    .appId(appId)
-                    .key(key)
-                    .one(srcId)
-                    .two(dstId)
-                    .selector(selector)
-                    .treatment(treatment)
-                    .constraints(constraints)
-                    .build();
 
-            intentService.submit(hostIntent);
+                SinglePointToMultiPointIntent s2MIntent = SinglePointToMultiPointIntent.builder()
+                        .appId(appId)
+                        .key(key)
+                        .selector(selector)
+                        .treatment(treatment)
+                        .filteredIngressPoint(new FilteredConnectPoint(src))
+                        .filteredEgressPoints(Sets.newHashSet(new FilteredConnectPoint(forwardPkt), new FilteredConnectPoint(mirrorPkt)))
+                        .constraints(constraints)
+                        .build();
+
+                intentService.submit(s2MIntent);           
         }
 
     }

@@ -1,5 +1,5 @@
 Manifest-Version: 1.0
-Bnd-LastModified: 1618871771896
+Bnd-LastModified: 1619026229828
 Build-Jdk: 11.0.7
 Built-By: root
 Bundle-Description: ONOS detector for denial of service attacks on HTTP
