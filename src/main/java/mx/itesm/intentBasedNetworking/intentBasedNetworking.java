@@ -139,6 +139,7 @@ import org.onosproject.net.intent.Key;
 import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.packet.OutboundPacket;
 import org.onosproject.net.intent.SinglePointToMultiPointIntent;
+import org.onosproject.net.intent.PointToPointIntent;
 import org.onosproject.net.FilteredConnectPoint;
 
 
@@ -184,9 +185,9 @@ public class intentBasedNetworking {
 
     private static final int DROP_RULE_TIMEOUT = 300;
 
-    private static final DeviceId mirrorDeviceID = DeviceId.deviceId("of:0000000000000101");
-    private PortNumber mirrorPortNumber;
-    private static final PortNumber PktCollectorPortNumber = PortNumber.portNumber(1);
+    private static final DeviceId mirrorDeviceID = DeviceId.deviceId("of:0000000000000065");
+    private PortNumber mirrorPortNumber = PortNumber.portNumber(1);  // can change
+    private static final PortNumber PktCollectorPortNumber = PortNumber.portNumber(1); // port to which the flow collector is connected to
 
     private static final EnumSet<IntentState> WITHDRAWN_STATES = EnumSet.of(IntentState.WITHDRAWN,
                                                                             IntentState.WITHDRAWING,
@@ -552,7 +553,7 @@ public class intentBasedNetworking {
             // simply forward out to the destination and bail.
             if (pkt.receivedFrom().deviceId().equals(dst.location().deviceId())) {
                 if (!context.inPacket().receivedFrom().port().equals(dst.location().port())) {
-                    installRule(context, dst.location().port(), macMetrics);
+                    installRule(context, dst.location().port(), macMetrics,true);
                 }
                 return;
             }
@@ -581,7 +582,7 @@ public class intentBasedNetworking {
             }
 
             // Otherwise forward and be done with it.
-            installRule(context, path.src().port(), macMetrics);
+            installRule(context, path.src().port(), macMetrics,false);
         }
 
     }
@@ -600,19 +601,25 @@ public class intentBasedNetworking {
     // Selects a path from the given set that does not lead back to the
     // specified port if possible.
     private Path pickForwardPathIfPossible(Set<Path> paths, PortNumber notToPort) {
+        Path pathAvailable = null;
+        PortNumber temporal = null;
         for (Path path : paths) {
             Boolean includeMirrorDevice = false;
             for (Link link:path.links()){
-                if (link.dst().deviceId().equals(mirrorDeviceID)) { // avoid path that goes to the mirrorring SW
+                if (link.dst().deviceId().equals(mirrorDeviceID)) { // avoid paths that pass to the mirrorring SW
                     includeMirrorDevice = true;
-                    mirrorPortNumber = link.dst().port();
+                    temporal = link.dst().port();
                 }
             }
-            if (!path.src().port().equals(notToPort)  && !includeMirrorDevice) { // do not return to the same port
-                        return path;
-                    }
+            if (path.dst().deviceId().equals(mirrorDeviceID) && path.links().size()==1){ // get port that connects to the mirroring device
+                mirrorPortNumber = temporal;
+            }
+
+            if (!path.src().port().equals(notToPort) && !includeMirrorDevice) { // do not return to the same port
+                         pathAvailable = path;
+            }
         }
-        return null;
+        return pathAvailable;
     }
 
     // Floods the specified packet if permissible.
@@ -633,7 +640,7 @@ public class intentBasedNetworking {
     }
 
     // Install a rule forwarding the packet to the specified port.
-    private void installRule(PacketContext context, PortNumber portNumber, ReactiveForwardMetrics macMetrics) {
+    private void installRule(PacketContext context, PortNumber portNumber, ReactiveForwardMetrics macMetrics, Boolean isEndDevice) {
         //
         // We don't support (yet) buffer IDs in the Flow Service so
         // packet out first.
@@ -760,21 +767,6 @@ public class intentBasedNetworking {
                     .build();
         }
 
-       /*ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
-                .withSelector(selectorBuilder.build())
-                .withTreatment(treatment)
-                .withPriority(flowPriority)
-                .withFlag(ForwardingObjective.Flag.VERSATILE)
-                .fromApp(appId)
-                .makeTemporary(flowTimeout)
-                .add();
-    
-
-       flowObjectiveService.forward(context.inPacket().receivedFrom().deviceId(),
-                                     forwardingObjective);
-       forwardPacket(macMetrics);*/
-
-
 
 //  INTENT BASED NETWORKING
        
@@ -787,13 +779,27 @@ public class intentBasedNetworking {
 
        HostId srcId = HostId.hostId(inPkt.getSourceMAC());
        HostId dstId = HostId.hostId(inPkt.getDestinationMAC());
-       reactivePoint2MultipointIntentFwd(context, 
-                                         portNumber, // shortest path forwarding
-                                         mirrorPortNumber, // mirrorring to the IDS
-                                         srcId,        // src host, to evaluate
-                                         dstId     // dst host, to evaluate
-                                         );
 
+       Host dst = hostService.getHost(dstId);
+
+       if (isEndDevice){ //only collect data from the endDevice
+           reactivePoint2MultipointIntentFwd(context, 
+                                             portNumber, // shortest path forwarding
+                                             mirrorPortNumber, // mirrorring to the IDS
+                                             srcId,        // src host, to evaluate
+                                             dstId,     // dst host, to evaluate
+                                             selectorBuilder
+                                             );
+       } else{
+       // Poin to Point reactive Forwarding
+           reactivePoint2PointIntentFwd(context, 
+                                             portNumber, // shortest path forwarding
+                                             mirrorPortNumber, // mirrorring to the IDS
+                                             srcId,        // src host, to evaluate
+                                             dstId,     // dst host, to evaluate
+                                             selectorBuilder
+                                             );
+            }
 
 //////////////////////////
        //
@@ -968,18 +974,32 @@ public class intentBasedNetworking {
 
 
         // Point to Multipoint intent Install a rule forwarding the packet to the specified port.
-    private void reactivePoint2MultipointIntentFwd(PacketContext context, PortNumber fwdP, PortNumber mirrorP, HostId srcId, HostId dstId) {
-        TrafficSelector selector = DefaultTrafficSelector.emptySelector();
+    private void reactivePoint2MultipointIntentFwd(PacketContext context, PortNumber fwdP, PortNumber mirrorP, HostId srcId, HostId dstId, TrafficSelector.Builder selectorBuilder) {
         TrafficTreatment treatment = DefaultTrafficTreatment.emptyTreatment();
 
-        Key key;
+        ConnectPoint src = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                                    context.inPacket().receivedFrom().port());
+        
+        ConnectPoint  forwardPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                            fwdP);
+        ConnectPoint  mirrorPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                            mirrorP);
+        String DirHostConnection;
         if (srcId.toString().compareTo(dstId.toString()) < 0) {
-            key = Key.of(srcId.toString() + dstId.toString(), appId);
+            DirHostConnection = srcId.toString() + dstId.toString();
         } else {
-            key = Key.of(dstId.toString() + srcId.toString(), appId);
+            DirHostConnection = dstId.toString() + srcId.toString();
         }
+        Key key = Key.of(src.toString()+forwardPkt.toString()+mirrorPkt.toString()+DirHostConnection, appId);  // Intent Key definition
 
-        HostToHostIntent intent = (HostToHostIntent) intentService.getIntent(key);
+
+        log.warn("Packet from {}: Intent-> Src: SW {} Port {} >> DST:  SW {} Port {};; SW {} Port {};",
+                         context.inPacket().receivedFrom(), 
+                         context.inPacket().receivedFrom().deviceId(),context.inPacket().receivedFrom().port(), //src
+                         context.inPacket().receivedFrom().deviceId(),fwdP,
+                         context.inPacket().receivedFrom().deviceId(),mirrorP);
+
+        SinglePointToMultiPointIntent intent = (SinglePointToMultiPointIntent) intentService.getIntent(key);
         // TODO handle the FAILED state
         if (intent != null) {
             if (WITHDRAWN_STATES.contains(intentService.getIntentState(key))) {
@@ -990,21 +1010,12 @@ public class intentBasedNetworking {
                 final List<Constraint> constraints = new LinkedList<>();
 
                 constraints.add(constraintBandwidth);
-                constraints.add(constraintLatency);
-                
-                ConnectPoint src = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
-                                                    context.inPacket().receivedFrom().port());
-        
-                ConnectPoint  forwardPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
-                                                    fwdP);
-                ConnectPoint  mirrorPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
-                                                    mirrorP);
-
+                constraints.add(constraintLatency);             
 
                 SinglePointToMultiPointIntent s2MIntent = SinglePointToMultiPointIntent.builder()
                         .appId(appId)
                         .key(key)
-                        .selector(selector)
+                        .selector(selectorBuilder.build())
                         .treatment(treatment)
                         .filteredIngressPoint(new FilteredConnectPoint(src))
                         .filteredEgressPoints(Sets.newHashSet(new FilteredConnectPoint(forwardPkt), new FilteredConnectPoint(mirrorPkt)))
@@ -1014,7 +1025,6 @@ public class intentBasedNetworking {
                 intentService.submit(s2MIntent);
 
             } else if (intentService.getIntentState(key) == IntentState.FAILED) {
-
                 TrafficSelector objectiveSelector = DefaultTrafficSelector.builder()
                         .matchEthSrc(srcId.mac()).matchEthDst(dstId.mac()).build();
 
@@ -1031,7 +1041,7 @@ public class intentBasedNetworking {
                         .add();
 
                 flowObjectiveService.forward(context.outPacket().sendThrough(), objective);
-            }
+            }  
 
         } else if (intent == null) {
             final Constraint constraintBandwidth =
@@ -1042,23 +1052,109 @@ public class intentBasedNetworking {
 
                 constraints.add(constraintBandwidth);
                 constraints.add(constraintLatency);
-                
-                ConnectPoint src = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
-                                                    context.inPacket().receivedFrom().port());
-        
-                ConnectPoint  forwardPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
-                                                    fwdP);
-                ConnectPoint  mirrorPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
-                                                    mirrorP);
-
 
                 SinglePointToMultiPointIntent s2MIntent = SinglePointToMultiPointIntent.builder()
                         .appId(appId)
                         .key(key)
-                        .selector(selector)
+                        .selector(selectorBuilder.build())
                         .treatment(treatment)
                         .filteredIngressPoint(new FilteredConnectPoint(src))
                         .filteredEgressPoints(Sets.newHashSet(new FilteredConnectPoint(forwardPkt), new FilteredConnectPoint(mirrorPkt)))
+                        .constraints(constraints)
+                        .build();
+
+                intentService.submit(s2MIntent);           
+        }
+
+    }
+
+        // Point to Multipoint intent Install a rule forwarding the packet to the specified port.
+    private void reactivePoint2PointIntentFwd(PacketContext context, PortNumber fwdP, PortNumber mirrorP, HostId srcId, HostId dstId, TrafficSelector.Builder selectorBuilder) {
+        TrafficTreatment treatment = DefaultTrafficTreatment.emptyTreatment();
+
+        ConnectPoint src = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                                    context.inPacket().receivedFrom().port());
+        
+        ConnectPoint  forwardPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                            fwdP);
+        ConnectPoint  mirrorPkt = new ConnectPoint(context.inPacket().receivedFrom().deviceId(), 
+                                            mirrorP);
+        String DirHostConnection;
+        if (srcId.toString().compareTo(dstId.toString()) < 0) {
+            DirHostConnection = srcId.toString() + dstId.toString();
+        } else {
+            DirHostConnection = dstId.toString() + srcId.toString();
+        }
+        Key key = Key.of(src.toString()+forwardPkt.toString()+mirrorPkt.toString()+DirHostConnection, appId);  // Intent Key definition
+
+
+        log.warn("Packet from {}: Intent-> Src: SW {} Port {} >> DST:  SW {} Port {};; SW {} Port {};",
+                         context.inPacket().receivedFrom(), 
+                         context.inPacket().receivedFrom().deviceId(),context.inPacket().receivedFrom().port(), //src
+                         context.inPacket().receivedFrom().deviceId(),fwdP,
+                         context.inPacket().receivedFrom().deviceId(),mirrorP);
+
+        PointToPointIntent intent = (PointToPointIntent) intentService.getIntent(key);
+        // TODO handle the FAILED state
+        if (intent != null) {
+            if (WITHDRAWN_STATES.contains(intentService.getIntentState(key))) {
+                final Constraint constraintBandwidth =
+                new BandwidthConstraint(Bandwidth.mbps(1));
+                final Constraint constraintLatency =
+                    new LatencyConstraint(Duration.of(1, ChronoUnit.MICROS));
+                final List<Constraint> constraints = new LinkedList<>();
+
+                constraints.add(constraintBandwidth);
+                constraints.add(constraintLatency);             
+
+                PointToPointIntent s2MIntent = PointToPointIntent.builder()
+                        .appId(appId)
+                        .key(key)
+                        .selector(selectorBuilder.build())
+                        .treatment(treatment)
+                        .filteredIngressPoint(new FilteredConnectPoint(src))
+                        .filteredEgressPoint(new FilteredConnectPoint(forwardPkt))
+                        .constraints(constraints)
+                        .build();
+
+                intentService.submit(s2MIntent);
+
+            } else if (intentService.getIntentState(key) == IntentState.FAILED) {
+                TrafficSelector objectiveSelector = DefaultTrafficSelector.builder()
+                        .matchEthSrc(srcId.mac()).matchEthDst(dstId.mac()).build();
+
+                TrafficTreatment dropTreatment = DefaultTrafficTreatment.builder()
+                        .drop().build();
+
+                ForwardingObjective objective = DefaultForwardingObjective.builder()
+                        .withSelector(objectiveSelector)
+                        .withTreatment(dropTreatment)
+                        .fromApp(appId)
+                        .withPriority(intent.priority() - 1)
+                        .makeTemporary(DROP_RULE_TIMEOUT)
+                        .withFlag(ForwardingObjective.Flag.VERSATILE)
+                        .add();
+
+                flowObjectiveService.forward(context.outPacket().sendThrough(), objective);
+            }  
+
+        } else if (intent == null) {
+            final Constraint constraintBandwidth =
+                new BandwidthConstraint(Bandwidth.mbps(1));
+                final Constraint constraintLatency =
+                    new LatencyConstraint(Duration.of(1, ChronoUnit.MICROS));
+                final List<Constraint> constraints = new LinkedList<>();
+
+                constraints.add(constraintBandwidth);
+                constraints.add(constraintLatency);
+
+                PointToPointIntent s2MIntent = PointToPointIntent.builder()
+                        .appId(appId)
+                        .key(key)
+                        .selector(selectorBuilder.build())
+                        .treatment(treatment)
+                        .filteredIngressPoint(new FilteredConnectPoint(src))
+                        .filteredEgressPoint(new FilteredConnectPoint(forwardPkt))
                         .constraints(constraints)
                         .build();
 
