@@ -996,7 +996,10 @@ public class intentBasedNetworking {
         }
         // TODO handle the FAILED state
         if (intent != null) {
+            log.warn("Already installed from {}",
+                         context.inPacket().receivedFrom());
             if (WITHDRAWN_STATES.contains(intentService.getIntentState(key))) {
+                log.warn("WITHDRAWIstate");
                 final Constraint constraintBandwidth =
                 new BandwidthConstraint(Bandwidth.mbps(1));
                 final Constraint constraintLatency =
@@ -1033,6 +1036,7 @@ public class intentBasedNetworking {
                }
 
             } else if (intentService.getIntentState(key) == IntentState.FAILED) {
+                log.warn("FAILEDstate");
                 TrafficSelector objectiveSelector = DefaultTrafficSelector.builder()
                         .matchEthSrc(srcId.mac()).matchEthDst(dstId.mac()).build();
 
@@ -1052,6 +1056,11 @@ public class intentBasedNetworking {
             }  
 
         } else if (intent == null) {
+                log.warn("Packet from {}: Intent-> Src: SW {} Port {} >> DST:  SW {} Port {};; SW {} Port {};",
+                         context.inPacket().receivedFrom(), 
+                         context.inPacket().receivedFrom().deviceId(),context.inPacket().receivedFrom().port(), //src
+                         context.inPacket().receivedFrom().deviceId(),fwdP,
+                         context.inPacket().receivedFrom().deviceId(),mirrorP);
                 final Constraint constraintBandwidth =
                 new BandwidthConstraint(Bandwidth.mbps(1));
                 final Constraint constraintLatency =
